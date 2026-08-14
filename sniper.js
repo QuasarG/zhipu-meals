@@ -1,10 +1,12 @@
 // 抢餐主脚本（守望模式）：每周五下午放餐，轮询探测下周菜单，出现即抢
 // 用法: node sniper.js menu [YYYYMMDD] | check [YYYYMMDD] | watch
+// 多人共部署：设 CONFIG_DIR 环境变量指向各自的配置目录
 const fs = require("fs");
 const path = require("path");
 const { init, getSign } = require("./signer.js");
 
-const cfgPath = path.join(__dirname, "config.json");
+const cfgDir = process.env.CONFIG_DIR || __dirname;
+const cfgPath = path.join(cfgDir, "config.json");
 const cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
 
 const BASE = "https://order.hersweetie.com/feishu-api";
