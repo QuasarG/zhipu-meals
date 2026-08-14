@@ -120,6 +120,69 @@ tail -f /var/log/zhipu-meals.log   # 实时日志
 systemctl restart zhipu-meals      # 改完 config.json 后重启生效
 ```
 
+## 多人共部署（一台服务器帮同事一起挂）
+
+脚本身份就是 config 里的 `openId`，一人一份配置即可共用同一份代码。
+通过 `CONFIG_DIR` 环境变量指定各自的配置目录，单人使用完全不受影响
+（不设该变量时默认读脚本同目录的 `config.json`，开箱即用）。
+
+目录结构：
+
+```
+/opt/zhipu-meals/                 # 共用代码（git clone 或 scp 一份）
+├── sniper.js
+├── signer.js
+├── wasm_encrypt.wasm
+├── config.json                   # 你自己的（默认实例）
+├── alice/config.json             # 同事 A：她的 openId + 她的楼层吧台
+└── bob/config.json               # 同事 B：他的 openId + 他的楼层吧台
+```
+
+每位同事一个 systemd 实例（unit 名、日志文件分开）：
+
+```bash
+cat > /etc/systemd/system/zhipu-meals-alice.service << 'EOF'
+[Unit]
+Description=Zhipu Meals daemon (alice)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/zhipu-meals
+Environment=CONFIG_DIR=/opt/zhipu-meals/alice
+ExecStart=/usr/bin/node /opt/zhipu-meals/sniper.js watch
+Restart=always
+RestartSec=30
+StandardOutput=append:/var/log/zhipu-meals-alice.log
+StandardError=append:/var/log/zhipu-meals-alice.log
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now zhipu-meals-alice
+```
+
+注意事项：
+
+- **一人一实例，各用各的 openId**（同事自己登录自己取），共用别人的等于替别人下单
+- openId 各自独立过期，谁的 401 了谁重登更新，互不影响
+- 建议各实例轮询间隔稍微错开（如同事的 `idlePollIntervalMs` 设 660000、
+  `burstPollIntervalMs` 设 70000），避免同 IP 同秒并发请求
+- 单实例内存约 33MB，一台 2G 服务器挂十来个同事毫无压力
+
+## 手动命令补充（指定他人的配置）
+
+```bash
+# 默认读脚本同目录 config.json
+node sniper.js menu 20260818
+
+# 多人部署时指定某位同事的配置目录
+CONFIG_DIR=/opt/zhipu-meals/alice node sniper.js check 20260818
+```
+
 ## config.json 完整字段说明
 
 | 字段 | 类型 | 说明 |
