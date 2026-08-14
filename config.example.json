@@ -1,0 +1,13 @@
+{
+  "openId": "在这里粘贴你的openId",
+  "mealTypes": ["1", "2"],
+  "dates": [],
+  "keywords": [],
+  "addressId": null,
+  "addressDetail": "",
+  "dryRun": true,
+  "pollIntervalMs": 60000,
+  "perDateGapMs": 2000,
+  "rateLimitCooldownMin": 10,
+  "doneSleepMin": 30
+}
