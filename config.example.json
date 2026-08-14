@@ -6,7 +6,9 @@
   "addressId": null,
   "addressDetail": "",
   "dryRun": true,
-  "pollIntervalMs": 60000,
+  "idlePollIntervalMs": 600000,
+  "burstPollIntervalMs": 60000,
+  "burstStartHour": 0,
   "perDateGapMs": 2000,
   "rateLimitCooldownMin": 10,
   "doneSleepMin": 30
