@@ -149,7 +149,16 @@ async function cmdWatch() {
   }
   const cooldownMs = (cfg.rateLimitCooldownMin || 10) * 60 * 1000;
   const doneSleepMs = (cfg.doneSleepMin || 30) * 60 * 1000;
+  // 变频守望：平时低频安静盯梢，放餐窗口（周五全天）切高频抢首发
+  const idleMs = (cfg.idlePollIntervalMs || 600000);      // 平时：10 分钟一轮
+  const burstMs = (cfg.burstPollIntervalMs || 60000);     // 周五放餐窗口：1 分钟一轮
+  const burstHour = cfg.burstStartHour ?? 0;              // 周五 0 点起进入高频
+  const pollMs = () => {
+    const now = new Date();
+    return now.getDay() === 5 && now.getHours() >= burstHour ? burstMs : idleMs;
+  };
   console.log(`守望 ${mealTypes.map((m) => MEAL_NAME[m]).join("+")} | 目标: ${cfg.dates && cfg.dates.length ? cfg.dates.join(", ") : "动态下周一~周五"}`);
+  console.log(`轮询: 平时 ${idleMs / 60000} 分钟/轮，周五 ${burstHour} 点起 ${burstMs / 60000} 分钟/轮`);
   console.log(`策略: ${cfg.keywords && cfg.keywords.length ? "关键词[" + cfg.keywords.join(",") + "] + " : ""}份数最少优先 | 地址: ${cfg.addressDetail}(id=${cfg.addressId})`);
   if (cfg.dryRun) console.log("!! dryRun 模式：只探测不真实下单");
   const done = new Set(); // key: `${date}:${mealType}`
@@ -234,7 +243,9 @@ async function cmdWatch() {
     }
 
     const allDone = targets.every((d) => mealTypes.every((mt) => done.has(`${d}:${mt}`)));
-    await sleep(rateLimited ? cooldownMs : allDone ? doneSleepMs : (cfg.pollIntervalMs || 60000));
+    const wait = rateLimited ? cooldownMs : allDone ? doneSleepMs : pollMs();
+    console.log(`${new Date().toLocaleTimeString()} 本轮结束，${wait >= 60000 ? Math.round(wait / 60000) + " 分钟" : wait / 1000 + " 秒"}后再见`);
+    await sleep(wait);
   }
 }
 
