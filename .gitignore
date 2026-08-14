@@ -1,0 +1,4 @@
+# 真实配置含 openId 凭证，禁止提交
+config.json
+node_modules/
+*.log
