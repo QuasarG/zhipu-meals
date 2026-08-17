@@ -151,21 +151,38 @@ async function cmdWatch() {
   }
   const cooldownMs = (cfg.rateLimitCooldownMin || 10) * 60 * 1000;
   const doneSleepMs = (cfg.doneSleepMin || 30) * 60 * 1000;
-  // 变频守望：平时低频安静盯梢，放餐窗口（周五全天）切高频抢首发
-  const idleMs = (cfg.idlePollIntervalMs || 600000);      // 平时：10 分钟一轮
-  const burstMs = (cfg.burstPollIntervalMs || 60000);     // 周五放餐窗口：1 分钟一轮
-  const burstHour = cfg.burstStartHour ?? 0;              // 周五 0 点起进入高频
-  const pollMs = () => {
-    const now = new Date();
-    return now.getDay() === 5 && now.getHours() >= burstHour ? burstMs : idleMs;
+  // 活跃窗口制：周一~周四完全静默长眠；周五 activeStartHour 起每分钟一轮
+  // 周五之后（周末）窗口保持开启，用于「取消后自动补抢」；全部完成后每轮零请求
+  const activeHour = cfg.activeStartHour ?? 13;
+  const activeMs = cfg.pollIntervalMs || 60000;
+  const useWindow = !(cfg.dates && cfg.dates.length); // 显式指定 dates 时不限窗口，便于测试
+  const inWindow = (now = new Date()) => {
+    const day = now.getDay(); // 0=周日 5=周五 6=周六
+    if (day === 5) return now.getHours() >= activeHour;
+    return day === 6 || day === 0;
+  };
+  const msUntilWindow = (now = new Date()) => {
+    const t = new Date(now);
+    t.setDate(now.getDate() + ((5 - now.getDay() + 7) % 7));
+    t.setHours(activeHour, 0, 0, 0);
+    if (t <= now) t.setDate(t.getDate() + 7);
+    return t - now;
   };
   console.log(`守望 ${mealTypes.map((m) => MEAL_NAME[m]).join("+")} | 目标: ${cfg.dates && cfg.dates.length ? cfg.dates.join(", ") : "动态下周一~周五"}`);
-  console.log(`轮询: 平时 ${idleMs / 60000} 分钟/轮，周五 ${burstHour} 点起 ${burstMs / 60000} 分钟/轮`);
+  console.log(`轮询: ${useWindow ? `周五 ${activeHour}:00 起 ${activeMs / 1000} 秒/轮，周一~周四静默` : "指定 dates，不限窗口"}`);
   console.log(`策略: ${cfg.keywords && cfg.keywords.length ? "关键词[" + cfg.keywords.join(",") + "] + " : ""}份数最少优先 | 地址: ${cfg.addressDetail}(id=${cfg.addressId})`);
   if (cfg.dryRun) console.log("!! dryRun 模式：只探测不真实下单");
   const done = new Set(); // key: `${date}:${mealType}`
 
   while (true) {
+    // 非活跃窗口：整轮跳过，零请求，一觉睡到周五 activeStartHour
+    if (useWindow && !inWindow()) {
+      const wait = msUntilWindow();
+      const hrs = Math.round(wait / 3600000);
+      console.log(`${new Date().toLocaleTimeString()} 非活跃窗口（周一~周四/周五${activeHour}点前），休眠 ${hrs} 小时至周五 ${activeHour}:00 开抢`);
+      await sleep(wait);
+      continue;
+    }
     const targets = cfg.dates && cfg.dates.length ? cfg.dates : nextWeekWorkdays();
     // 跨周滚动：清掉不属于本周目标的完成标记
     for (const k of [...done]) {
@@ -245,7 +262,7 @@ async function cmdWatch() {
     }
 
     const allDone = targets.every((d) => mealTypes.every((mt) => done.has(`${d}:${mt}`)));
-    const wait = rateLimited ? cooldownMs : allDone ? doneSleepMs : pollMs();
+    const wait = rateLimited ? cooldownMs : allDone ? doneSleepMs : activeMs;
     console.log(`${new Date().toLocaleTimeString()} 本轮结束，${wait >= 60000 ? Math.round(wait / 60000) + " 分钟" : wait / 1000 + " 秒"}后再见`);
     await sleep(wait);
   }
