@@ -236,11 +236,17 @@ async function cmdWatch() {
     }
 
     // 扫荡模式：侦察发现菜单已放，立刻全量处理所有日期
+    // 稀缺款（放出时两位数库存）竞争窗口极短，两阶段策略：
+    //   阶段一：逐日期拉菜单，撞见稀缺候选立即下单（跳过订单预查，最快 8 秒锁定）
+    //   阶段二：剩余目标按稀缺度排序，走完整流程（订单预查+下单+死名单重试）
     if (released && !rateLimited) {
       const dead = new Set(); // 下单失败（库存不足等）的 "日期|套餐名"
-      // 先全量拉菜单+订单，再按稀缺度排序统一下单：紧俏餐最先出手
+      const scarce = cfg.scarceThreshold ?? 100; // 两位数 = 稀缺
       const plan = [];
+
+      // 阶段一：边拉菜单边抢稀缺
       for (const d of targets) {
+        if (rateLimited) break;
         try {
           const menus = {};
           for (const mt of mealTypes) {
@@ -256,34 +262,81 @@ async function cmdWatch() {
           if (rateLimited) break;
           if (!Object.keys(menus).length) continue; // 该日期还没放餐
 
-          const o = await getMyOrder(d);
-          if (isRateLimited(o)) {
-            console.log(`[${d}] 被限流: ${o.msg} → 退避 ${cooldownMs / 60000} 分钟`);
-            rateLimited = true;
-            break;
-          }
-
           for (const mt of Object.keys(menus)) {
             if (done.has(`${d}:${mt}`)) continue;
-            const slot = o.code === 200 && o.data ? o.data[MEAL_KEY[mt]] : null;
-            if (Array.isArray(slot) && slot.length && ![0, 3].includes(slot[0].orderStatus)) {
-              console.log(`[${d} ${MEAL_NAME[mt]}] 已有订单（${(slot[0].packageName || "").split("\n")[0]}），跳过`);
+            const pkg = pickPackage(menus[mt], cfg.keywords, dead, d);
+            if (!pkg) {
               done.add(`${d}:${mt}`);
               continue;
             }
-            plan.push({ d, mt, menus: menus[mt] });
+            if ((pkg.stockRemaining ?? Infinity) < scarce) {
+              console.log(`[${d} ${MEAL_NAME[mt]}] ⚡稀缺 ${pkgDesc(pkg)} → 跳过预查直接下单`);
+              if (cfg.dryRun) {
+                console.log(`[${d} ${MEAL_NAME[mt]}] dryRun: 模拟下单成功`);
+                done.add(`${d}:${mt}`);
+                continue;
+              }
+              try {
+                const r = await createOrder({
+                  mealType: mt,
+                  orderDate: d,
+                  packageName: pkg.packageName,
+                  sequenceChar: pkg.sequenceChar,
+                  addressId: cfg.addressId,
+                  addressDetail: cfg.addressDetail,
+                });
+                if (r.code === 200) {
+                  console.log(`[${d} ${MEAL_NAME[mt]}] ⚡下单成功 orderId=${r.data?.orderId}`);
+                  done.add(`${d}:${mt}`);
+                  continue;
+                }
+                if (isRateLimited(r)) {
+                  console.log(`[${d} ${MEAL_NAME[mt]}] 被限流: ${r.msg} → 退避`);
+                  rateLimited = true;
+                  break;
+                }
+                // 失败（库存被截/已点等）：标记死亡，留给阶段二完整流程复核
+                console.log(`[${d} ${MEAL_NAME[mt]}] ⚡失败(${r.code}): ${r.msg} → 交给阶段二复核`);
+                dead.add(`${d}|${pkg.packageName}`);
+              } catch (e) {
+                console.error(`[${d} ${MEAL_NAME[mt]}] ⚡下单异常:`, e.message);
+              }
+            }
+            if (!done.has(`${d}:${mt}`)) plan.push({ d, mt, menus: menus[mt] });
           }
         } catch (e) {
           console.error(`[${d}] 扫荡查询异常:`, e.message);
         }
       }
 
+      // 阶段二：剩余目标按稀缺度排序，查订单后下单，两轮死名单重试
       if (!rateLimited && plan.length) {
-        // 两轮尝试：第一轮按份数升序抢最紧俏的；失败的套餐排除后立即重选
+        const orderCache = {};
         for (let round = 0; round < 2; round++) {
           const queue = [];
           for (const { d, mt, menus } of plan) {
             if (done.has(`${d}:${mt}`)) continue;
+            let o = orderCache[d];
+            if (!o) {
+              try {
+                o = await getMyOrder(d);
+              } catch (e) {
+                console.error(`[${d}] 订单查询异常:`, e.message);
+                continue;
+              }
+              if (isRateLimited(o)) {
+                console.log(`[${d}] 被限流: ${o.msg} → 退避 ${cooldownMs / 60000} 分钟`);
+                rateLimited = true;
+                break;
+              }
+              orderCache[d] = o;
+            }
+            const slot = o.code === 200 && o.data ? o.data[MEAL_KEY[mt]] : null;
+            if (Array.isArray(slot) && slot.length && ![0, 3].includes(slot[0].orderStatus)) {
+              console.log(`[${d} ${MEAL_NAME[mt]}] 已有订单（${(slot[0].packageName || "").split("\n")[0]}），跳过`);
+              done.add(`${d}:${mt}`);
+              continue;
+            }
             const pkg = pickPackage(menus, cfg.keywords, dead, d);
             if (!pkg) {
               console.log(`[${d} ${MEAL_NAME[mt]}] 无匹配项/全售罄`);
@@ -292,26 +345,24 @@ async function cmdWatch() {
             }
             queue.push({ d, mt, pkg });
           }
-          if (!queue.length) break;
-          // 稀缺度排序：余量少的先下单，爆款窗口期最短
+          if (rateLimited || !queue.length) break;
           queue.sort((a, b) => (a.pkg.stockRemaining ?? Infinity) - (b.pkg.stockRemaining ?? Infinity));
           for (const { d, mt, pkg } of queue) {
             try {
               console.log(`[${d} ${MEAL_NAME[mt]}] 命中 ${pkgDesc(pkg)} → 下单`);
               if (cfg.dryRun) {
-                console.log(`[${d} ${MEAL_NAME[mt]}] dryRun: 模拟下单成功，不发送请求`);
+                console.log(`[${d} ${MEAL_NAME[mt]}] dryRun: 模拟下单成功`);
                 done.add(`${d}:${mt}`);
                 continue;
               }
-              const payload = {
+              const r = await createOrder({
                 mealType: mt,
                 orderDate: d,
                 packageName: pkg.packageName,
                 sequenceChar: pkg.sequenceChar,
                 addressId: cfg.addressId,
                 addressDetail: cfg.addressDetail,
-              };
-              const r = await createOrder(payload);
+              });
               if (r.code === 200) {
                 console.log(`[${d} ${MEAL_NAME[mt]}] 下单成功 orderId=${r.data?.orderId}`);
                 done.add(`${d}:${mt}`);
@@ -320,7 +371,7 @@ async function cmdWatch() {
                 rateLimited = true;
                 break;
               } else {
-                console.log(`[${d} ${MEAL_NAME[mt]}] 下单失败(${r.code}): ${r.msg} → 标记死亡，换候选`);
+                console.log(`[${d} ${MEAL_NAME[mt]}] 下单失败(${r.code}): ${r.msg} → 换候选`);
                 dead.add(`${d}|${pkg.packageName}`);
               }
             } catch (e) {
@@ -328,8 +379,7 @@ async function cmdWatch() {
             }
           }
           if (rateLimited || round === 1) break;
-          const remaining = plan.some(({ d, mt }) => !done.has(`${d}:${mt}`));
-          if (!remaining) break;
+          if (!plan.some(({ d, mt }) => !done.has(`${d}:${mt}`))) break;
           console.log(`--- 第二轮：对失败目标换候选重试 ---`);
         }
       }
