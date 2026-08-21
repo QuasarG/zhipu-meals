@@ -8,7 +8,7 @@
   "dryRun": true,
   "activeStartHour": 13,
   "pollIntervalMs": 60000,
-  "perDateGapMs": 2000,
+  "requestGapMs": 4000,
   "rateLimitCooldownMin": 10,
   "doneSleepMin": 30
 }
