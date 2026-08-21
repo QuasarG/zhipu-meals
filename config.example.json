@@ -9,6 +9,7 @@
   "activeStartHour": 13,
   "pollIntervalMs": 60000,
   "requestGapMs": 4000,
+  "scarceThreshold": 100,
   "rateLimitCooldownMin": 10,
   "doneSleepMin": 30
 }
