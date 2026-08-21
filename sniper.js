@@ -78,9 +78,14 @@ const getMyOrder = (orderDate) => api("GET", "/v2/order/listByUidAndDate", { ord
 const createOrder = (payload) => api("POST", "/order/create", null, payload);
 
 // 选餐策略：keywords 非空时先按关键词过滤；最终取剩余份数最少且有货的
-function pickPackage(menuData, keywords) {
+// dead: 本轮扫荡中下单失败（如库存不足）的 "日期|套餐名" 集合，排除后重选
+function pickPackage(menuData, keywords, dead, date) {
   if (!Array.isArray(menuData) || !menuData.length) return null;
-  const avail = menuData.filter((p) => p.stockRemaining === undefined || p.stockRemaining > 0);
+  const avail = menuData.filter((p) => {
+    if (p.stockRemaining !== undefined && p.stockRemaining <= 0) return false;
+    if (dead && dead.has(`${date}|${p.packageName}`)) return false;
+    return true;
+  });
   if (!avail.length) return null;
   let pool = avail;
   if (keywords && keywords.length) {
@@ -232,6 +237,9 @@ async function cmdWatch() {
 
     // 扫荡模式：侦察发现菜单已放，立刻全量处理所有日期
     if (released && !rateLimited) {
+      const dead = new Set(); // 下单失败（库存不足等）的 "日期|套餐名"
+      // 先全量拉菜单+订单，再按稀缺度排序统一下单：紧俏餐最先出手
+      const plan = [];
       for (const d of targets) {
         try {
           const menus = {};
@@ -248,7 +256,6 @@ async function cmdWatch() {
           if (rateLimited) break;
           if (!Object.keys(menus).length) continue; // 该日期还没放餐
 
-          // 菜单放出了才查订单（一天一发，返回三餐全量）
           const o = await getMyOrder(d);
           if (isRateLimited(o)) {
             console.log(`[${d}] 被限流: ${o.msg} → 退避 ${cooldownMs / 60000} 分钟`);
@@ -258,40 +265,72 @@ async function cmdWatch() {
 
           for (const mt of Object.keys(menus)) {
             if (done.has(`${d}:${mt}`)) continue;
-            console.log(`[${d}] ${MEAL_NAME[mt]} 菜单已放出（${menus[mt].length} 个套餐）`);
             const slot = o.code === 200 && o.data ? o.data[MEAL_KEY[mt]] : null;
             if (Array.isArray(slot) && slot.length && ![0, 3].includes(slot[0].orderStatus)) {
               console.log(`[${d} ${MEAL_NAME[mt]}] 已有订单（${(slot[0].packageName || "").split("\n")[0]}），跳过`);
               done.add(`${d}:${mt}`);
               continue;
             }
-            const pkg = pickPackage(menus[mt], cfg.keywords);
+            plan.push({ d, mt, menus: menus[mt] });
+          }
+        } catch (e) {
+          console.error(`[${d}] 扫荡查询异常:`, e.message);
+        }
+      }
+
+      if (!rateLimited && plan.length) {
+        // 两轮尝试：第一轮按份数升序抢最紧俏的；失败的套餐排除后立即重选
+        for (let round = 0; round < 2; round++) {
+          const queue = [];
+          for (const { d, mt, menus } of plan) {
+            if (done.has(`${d}:${mt}`)) continue;
+            const pkg = pickPackage(menus, cfg.keywords, dead, d);
             if (!pkg) {
               console.log(`[${d} ${MEAL_NAME[mt]}] 无匹配项/全售罄`);
               done.add(`${d}:${mt}`);
               continue;
             }
-            console.log(`[${d} ${MEAL_NAME[mt]}] 命中 ${pkgDesc(pkg)} → 下单`);
-            if (cfg.dryRun) {
-              console.log(`[${d} ${MEAL_NAME[mt]}] dryRun: 模拟下单成功，不发送请求`);
-              done.add(`${d}:${mt}`);
-              continue;
-            }
-            const payload = {
-              mealType: mt,
-              orderDate: d,
-              packageName: pkg.packageName,
-              sequenceChar: pkg.sequenceChar,
-              addressId: cfg.addressId,
-              addressDetail: cfg.addressDetail,
-            };
-            const r = await createOrder(payload);
-            console.log(`[${d} ${MEAL_NAME[mt]}] 下单结果:`, JSON.stringify(r));
-            if (r.code === 200) done.add(`${d}:${mt}`);
-            else if (isRateLimited(r)) rateLimited = true;
+            queue.push({ d, mt, pkg });
           }
-        } catch (e) {
-          console.error(`[${d}] 请求异常:`, e.message);
+          if (!queue.length) break;
+          // 稀缺度排序：余量少的先下单，爆款窗口期最短
+          queue.sort((a, b) => (a.pkg.stockRemaining ?? Infinity) - (b.pkg.stockRemaining ?? Infinity));
+          for (const { d, mt, pkg } of queue) {
+            try {
+              console.log(`[${d} ${MEAL_NAME[mt]}] 命中 ${pkgDesc(pkg)} → 下单`);
+              if (cfg.dryRun) {
+                console.log(`[${d} ${MEAL_NAME[mt]}] dryRun: 模拟下单成功，不发送请求`);
+                done.add(`${d}:${mt}`);
+                continue;
+              }
+              const payload = {
+                mealType: mt,
+                orderDate: d,
+                packageName: pkg.packageName,
+                sequenceChar: pkg.sequenceChar,
+                addressId: cfg.addressId,
+                addressDetail: cfg.addressDetail,
+              };
+              const r = await createOrder(payload);
+              if (r.code === 200) {
+                console.log(`[${d} ${MEAL_NAME[mt]}] 下单成功 orderId=${r.data?.orderId}`);
+                done.add(`${d}:${mt}`);
+              } else if (isRateLimited(r)) {
+                console.log(`[${d} ${MEAL_NAME[mt]}] 被限流: ${r.msg} → 退避`);
+                rateLimited = true;
+                break;
+              } else {
+                console.log(`[${d} ${MEAL_NAME[mt]}] 下单失败(${r.code}): ${r.msg} → 标记死亡，换候选`);
+                dead.add(`${d}|${pkg.packageName}`);
+              }
+            } catch (e) {
+              console.error(`[${d} ${MEAL_NAME[mt]}] 下单异常:`, e.message);
+            }
+          }
+          if (rateLimited || round === 1) break;
+          const remaining = plan.some(({ d, mt }) => !done.has(`${d}:${mt}`));
+          if (!remaining) break;
+          console.log(`--- 第二轮：对失败目标换候选重试 ---`);
         }
       }
     }
