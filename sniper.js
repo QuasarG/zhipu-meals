@@ -38,13 +38,14 @@ function nextWeekWorkdays() {
   return out;
 }
 
-// 全局请求步进：任意两个请求之间至少间隔 requestGapMs，避免短时突发触发频控
+// 全局请求步进：可动态调整（守望期防限流；扫荡期降到 sweepGapMs）
 let lastReqAt = 0;
+let currentGapMs = null; // null = 用 cfg.requestGapMs
 
 async function api(method, url, params, body) {
-  // 实测：GET 接口 50ms 间隔可行（0ms 连发触发限流，冷却约13分钟）；POST 下单不设限
-  // 取 500ms 留足余量：扫荡全流程 25 发约 12 秒完成
-  const gap = cfg.requestGapMs ?? 500;
+  // 实测：串行 GET 快速连打会触发令牌桶限流（容量≈24-30，回血≈0.25-0.5发/秒）；
+  // 并发齐发与 POST 下单不受限。守望 5s/发稳态，扫荡 0.5s/发短脉冲，下单并发齐发
+  const gap = currentGapMs ?? cfg.requestGapMs ?? 500;
   const wait = lastReqAt + gap - Date.now();
   if (wait > 0) await sleep(wait);
   lastReqAt = Date.now();
@@ -164,13 +165,15 @@ async function cmdWatch() {
     console.log("规则限制：只抢早餐(1)和午餐(2)，不碰晚餐。config.json 的 mealTypes 别含 3，喵。");
     process.exit(1);
   }
-  const cooldownMs = (cfg.rateLimitCooldownMin || 10) * 60 * 1000;
+  const cooldownMs = (cfg.rateLimitCooldownMin || 15) * 60 * 1000;
   const doneSleepMs = (cfg.doneSleepMin || 30) * 60 * 1000;
-  // 活跃窗口制：周一~周四完全静默长眠；周五 activeStartHour 起每分钟一轮
-  // 周五之后（周末）窗口保持开启，用于「取消后自动补抢」；全部完成后每轮零请求
+  // 活跃窗口制：周一~周四完全静默长眠；周五 activeStartHour 起进入高频守望
   const activeHour = cfg.activeStartHour ?? 13;
-  const activeMs = cfg.pollIntervalMs || 10000; // 实测单点侦察可承受更高频，10 秒一轮
   const useWindow = !(cfg.dates && cfg.dates.length); // 显式指定 dates 时不限窗口，便于测试
+  // 三段变速（实测令牌桶容量≈24-30、回血≈0.25-0.5发/秒；并发齐发不受限）：
+  //   守望 5s/发（0.2发/秒 < 回血速率，永不触发）；发现放餐后 0.5s/发连拉 10 餐即停
+  const watchGapMs = cfg.watchGapMs || 5000;
+  const sweepGapMs = cfg.sweepGapMs || 500;
   const inWindow = (now = new Date()) => {
     const day = now.getDay(); // 0=周日 5=周五 6=周六
     if (day === 5) return now.getHours() >= activeHour;
@@ -184,11 +187,31 @@ async function cmdWatch() {
     return t - now;
   };
   console.log(`守望 ${mealTypes.map((m) => MEAL_NAME[m]).join("+")} | 目标: ${cfg.dates && cfg.dates.length ? cfg.dates.join(", ") : "动态下周一~周五"}`);
-  console.log(`轮询: ${useWindow ? `周五 ${activeHour}:00 起每轮 1 发侦察（${activeMs / 1000} 秒/轮），放出即扫荡，周一~周四静默` : "指定 dates，不限窗口"}`);
+  console.log(`节奏: ${useWindow ? `周五 ${activeHour}:00 起守望 ${watchGapMs / 1000}s/发不停歇，放餐后 ${sweepGapMs}ms/发连拉菜单，齐发并发下单；周一~周四静默` : "指定 dates，不限窗口"}`);
   console.log(`策略: ${cfg.keywords && cfg.keywords.length ? "关键词[" + cfg.keywords.join(",") + "] + " : ""}份数最少优先 | 地址: ${cfg.addressDetail}(id=${cfg.addressId})`);
   if (cfg.dryRun) console.log("!! dryRun 模式：只探测不真实下单");
   const done = new Set(); // key: `${date}:${mealType}`
-  let cursor = 0; // 侦察轮转游标
+  let cursor = 0; // 守望轮转游标
+
+  // 并发下单（POST 实测不限流）：同批订单 Promise.all 齐发
+  async function fireOrders(batch) {
+    const results = await Promise.all(batch.map(async ({ d, mt, pkg }) => {
+      try {
+        const r = await createOrder({
+          mealType: mt,
+          orderDate: d,
+          packageName: pkg.packageName,
+          sequenceChar: pkg.sequenceChar,
+          addressId: cfg.addressId,
+          addressDetail: cfg.addressDetail,
+        });
+        return { d, mt, pkg, r };
+      } catch (e) {
+        return { d, mt, pkg, r: { code: -1, msg: e.message } };
+      }
+    }));
+    return results;
+  }
 
   while (true) {
     // 非活跃窗口：整轮跳过，零请求，一觉睡到周五 activeStartHour
@@ -205,7 +228,7 @@ async function cmdWatch() {
       if (!targets.includes(k.split(":")[0])) done.delete(k);
     }
 
-    // 侦察模式：未放餐阶段每轮只发 1 发菜单探测，轮转覆盖所有目标
+    // 等待守望：5s 一发单点探测，永不停歇（低于回血速率，理论上永不触发限流）
     const pending = [];
     for (const d of targets) {
       for (const mt of mealTypes) {
@@ -226,7 +249,7 @@ async function cmdWatch() {
     try {
       const menu = await getMenu(probe.mt, probe.d);
       if (isRateLimited(menu)) {
-        console.log(`[${probe.d} ${MEAL_NAME[probe.mt]}] ${new Date().toLocaleTimeString()} 被限流: ${menu.msg} → 退避 ${cooldownMs / 60000} 分钟`);
+        console.log(`[${probe.d} ${MEAL_NAME[probe.mt]}] ${new Date().toLocaleTimeString()} 被限流: ${menu.msg} → 退避 ${cooldownMs / 60000} 分钟（期间完全静默）`);
         rateLimited = true;
       } else if (menu.code === 200 && Array.isArray(menu.data) && menu.data.length) {
         released = true;
@@ -234,162 +257,113 @@ async function cmdWatch() {
         console.log(`[${probe.d} ${MEAL_NAME[probe.mt]}] 接口: ${menu.code} ${menu.msg || ""}`);
       }
     } catch (e) {
-      console.error(`[${probe.d}] 侦察异常:`, e.message);
+      console.error(`[${probe.d}] 守望异常:`, e.message);
     }
 
-    // 扫荡模式：侦察发现菜单已放，立刻全量处理所有日期
-    // 稀缺款（放出时两位数库存）竞争窗口极短，两阶段策略：
-    //   阶段一：逐日期拉菜单，撞见稀缺候选立即下单（跳过订单预查，最快 8 秒锁定）
-    //   阶段二：剩余目标按稀缺度排序，走完整流程（订单预查+下单+死名单重试）
+    // 扫荡：探测到放餐，0.5s/发连拉全部菜单（共约10发短脉冲），拉完立即并发下单
     if (released && !rateLimited) {
-      const dead = new Set(); // 下单失败（库存不足等）的 "日期|套餐名"
-      const scarce = cfg.scarceThreshold ?? 100; // 两位数 = 稀缺
-      const plan = [];
+      const t0 = Date.now();
+      currentGapMs = sweepGapMs; // 扫荡期提速
+      const dead = new Set();
+      const plan = []; // {d, mt, menus}
 
-      // 阶段一：边拉菜单边抢稀缺
       for (const d of targets) {
-        if (rateLimited) break;
-        try {
-          const menus = {};
-          for (const mt of mealTypes) {
-            if (done.has(`${d}:${mt}`)) continue;
+        const menus = {};
+        for (const mt of mealTypes) {
+          if (done.has(`${d}:${mt}`)) continue;
+          try {
             const menu = await getMenu(mt, d);
             if (isRateLimited(menu)) {
-              console.log(`[${d}] 被限流: ${menu.msg} → 退避 ${cooldownMs / 60000} 分钟`);
+              console.log(`[${d}] 拉菜单被限流: ${menu.msg}`);
               rateLimited = true;
               break;
             }
             if (menu.code === 200 && Array.isArray(menu.data) && menu.data.length) menus[mt] = menu.data;
+          } catch (e) {
+            console.error(`[${d}] 拉菜单异常:`, e.message);
           }
-          if (rateLimited) break;
-          if (!Object.keys(menus).length) continue; // 该日期还没放餐
-
-          for (const mt of Object.keys(menus)) {
-            if (done.has(`${d}:${mt}`)) continue;
-            const pkg = pickPackage(menus[mt], cfg.keywords, dead, d);
-            if (!pkg) {
-              done.add(`${d}:${mt}`);
-              continue;
-            }
-            if ((pkg.stockRemaining ?? Infinity) < scarce) {
-              console.log(`[${d} ${MEAL_NAME[mt]}] ⚡稀缺 ${pkgDesc(pkg)} → 跳过预查直接下单`);
-              if (cfg.dryRun) {
-                console.log(`[${d} ${MEAL_NAME[mt]}] dryRun: 模拟下单成功`);
-                done.add(`${d}:${mt}`);
-                continue;
-              }
-              try {
-                const r = await createOrder({
-                  mealType: mt,
-                  orderDate: d,
-                  packageName: pkg.packageName,
-                  sequenceChar: pkg.sequenceChar,
-                  addressId: cfg.addressId,
-                  addressDetail: cfg.addressDetail,
-                });
-                if (r.code === 200) {
-                  console.log(`[${d} ${MEAL_NAME[mt]}] ⚡下单成功 orderId=${r.data?.orderId}`);
-                  done.add(`${d}:${mt}`);
-                  continue;
-                }
-                if (isRateLimited(r)) {
-                  console.log(`[${d} ${MEAL_NAME[mt]}] 被限流: ${r.msg} → 退避`);
-                  rateLimited = true;
-                  break;
-                }
-                // 失败（库存被截/已点等）：标记死亡，留给阶段二完整流程复核
-                console.log(`[${d} ${MEAL_NAME[mt]}] ⚡失败(${r.code}): ${r.msg} → 交给阶段二复核`);
-                dead.add(`${d}|${pkg.packageName}`);
-              } catch (e) {
-                console.error(`[${d} ${MEAL_NAME[mt]}] ⚡下单异常:`, e.message);
-              }
-            }
-            if (!done.has(`${d}:${mt}`)) plan.push({ d, mt, menus: menus[mt] });
-          }
-        } catch (e) {
-          console.error(`[${d}] 扫荡查询异常:`, e.message);
         }
+        if (rateLimited) break;
+        for (const mt of Object.keys(menus)) plan.push({ d, mt, menus: menus[mt] });
       }
 
-      // 阶段二：剩余目标按稀缺度排序，查订单后下单，两轮死名单重试
       if (!rateLimited && plan.length) {
+        // 逐天查订单防重复（GET，带步进）
         const orderCache = {};
-        for (let round = 0; round < 2; round++) {
-          const queue = [];
-          for (const { d, mt, menus } of plan) {
-            if (done.has(`${d}:${mt}`)) continue;
-            let o = orderCache[d];
-            if (!o) {
-              try {
-                o = await getMyOrder(d);
-              } catch (e) {
-                console.error(`[${d}] 订单查询异常:`, e.message);
-                continue;
-              }
-              if (isRateLimited(o)) {
-                console.log(`[${d}] 被限流: ${o.msg} → 退避 ${cooldownMs / 60000} 分钟`);
-                rateLimited = true;
-                break;
-              }
-              orderCache[d] = o;
-            }
-            const slot = o.code === 200 && o.data ? o.data[MEAL_KEY[mt]] : null;
-            if (Array.isArray(slot) && slot.length && ![0, 3].includes(slot[0].orderStatus)) {
-              console.log(`[${d} ${MEAL_NAME[mt]}] 已有订单（${(slot[0].packageName || "").split("\n")[0]}），跳过`);
-              done.add(`${d}:${mt}`);
-              continue;
-            }
-            const pkg = pickPackage(menus, cfg.keywords, dead, d);
-            if (!pkg) {
-              console.log(`[${d} ${MEAL_NAME[mt]}] 无匹配项/全售罄`);
-              done.add(`${d}:${mt}`);
-              continue;
-            }
-            queue.push({ d, mt, pkg });
-          }
-          if (rateLimited || !queue.length) break;
-          queue.sort((a, b) => (a.pkg.stockRemaining ?? Infinity) - (b.pkg.stockRemaining ?? Infinity));
-          for (const { d, mt, pkg } of queue) {
+        const batch = [];
+        for (const { d, mt, menus } of plan) {
+          let o = orderCache[d];
+          if (!o) {
             try {
-              console.log(`[${d} ${MEAL_NAME[mt]}] 命中 ${pkgDesc(pkg)} → 下单`);
-              if (cfg.dryRun) {
-                console.log(`[${d} ${MEAL_NAME[mt]}] dryRun: 模拟下单成功`);
-                done.add(`${d}:${mt}`);
-                continue;
-              }
-              const r = await createOrder({
-                mealType: mt,
-                orderDate: d,
-                packageName: pkg.packageName,
-                sequenceChar: pkg.sequenceChar,
-                addressId: cfg.addressId,
-                addressDetail: cfg.addressDetail,
-              });
-              if (r.code === 200) {
-                console.log(`[${d} ${MEAL_NAME[mt]}] 下单成功 orderId=${r.data?.orderId}`);
-                done.add(`${d}:${mt}`);
-              } else if (isRateLimited(r)) {
-                console.log(`[${d} ${MEAL_NAME[mt]}] 被限流: ${r.msg} → 退避`);
-                rateLimited = true;
-                break;
-              } else {
-                console.log(`[${d} ${MEAL_NAME[mt]}] 下单失败(${r.code}): ${r.msg} → 换候选`);
-                dead.add(`${d}|${pkg.packageName}`);
-              }
+              o = await getMyOrder(d);
             } catch (e) {
-              console.error(`[${d} ${MEAL_NAME[mt]}] 下单异常:`, e.message);
+              console.error(`[${d}] 订单查询异常:`, e.message);
+              continue;
+            }
+            if (isRateLimited(o)) { rateLimited = true; break; }
+            orderCache[d] = o;
+          }
+          const slot = o?.code === 200 && o.data ? o.data[MEAL_KEY[mt]] : null;
+          if (Array.isArray(slot) && slot.length && ![0, 3].includes(slot[0].orderStatus)) {
+            console.log(`[${d} ${MEAL_NAME[mt]}] 已有订单（${(slot[0].packageName || "").split("\n")[0]}），跳过`);
+            done.add(`${d}:${mt}`);
+            continue;
+          }
+          const pkg = pickPackage(menus, cfg.keywords, dead, d);
+          if (!pkg) {
+            console.log(`[${d} ${MEAL_NAME[mt]}] 无匹配项/全售罄`);
+            done.add(`${d}:${mt}`);
+            continue;
+          }
+          batch.push({ d, mt, pkg });
+        }
+
+        // 并发齐发下单（POST 实测不限流）；失败目标进死名单，换候选再打一批（最多两轮）
+        for (let round = 0; round < 2 && !rateLimited; round++) {
+          if (!batch.length) break;
+          if (round > 0) {
+            // 重选候选：排除死名单后重新挑
+            batch.length = 0;
+            for (const { d, mt, menus } of plan) {
+              if (done.has(`${d}:${mt}`)) continue;
+              const pkg = pickPackage(menus, cfg.keywords, dead, d);
+              if (pkg) batch.push({ d, mt, pkg });
+              else { done.add(`${d}:${mt}`); }
+            }
+            if (!batch.length) break;
+            console.log(`--- 第二轮：换候选重试 ${batch.length} 个目标 ---`);
+          }
+          batch.sort((a, b) => (a.pkg.stockRemaining ?? Infinity) - (b.pkg.stockRemaining ?? Infinity));
+          if (cfg.dryRun) {
+            for (const { d, mt, pkg } of batch) {
+              console.log(`[${d} ${MEAL_NAME[mt]}] dryRun 命中 ${pkgDesc(pkg)}`);
+              done.add(`${d}:${mt}`);
+            }
+            break;
+          }
+          const results = await fireOrders(batch);
+          for (const { d, mt, pkg, r } of results) {
+            if (r.code === 200) {
+              console.log(`[${d} ${MEAL_NAME[mt]}] ✓下单成功 ${pkgDesc(pkg)} orderId=${r.data?.orderId}`);
+              done.add(`${d}:${mt}`);
+            } else if (isRateLimited(r)) {
+              console.log(`[${d} ${MEAL_NAME[mt]}] 被限流: ${r.msg}`);
+              rateLimited = true;
+            } else {
+              console.log(`[${d} ${MEAL_NAME[mt]}] 失败(${r.code}): ${r.msg} → 换候选`);
+              dead.add(`${d}|${pkg.packageName}`);
             }
           }
-          if (rateLimited || round === 1) break;
           if (!plan.some(({ d, mt }) => !done.has(`${d}:${mt}`))) break;
-          console.log(`--- 第二轮：对失败目标换候选重试 ---`);
         }
       }
+      console.log(`${new Date().toLocaleTimeString()} 扫荡完毕，耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+      currentGapMs = null; // 恢复守望步进
     }
 
     const allDone = targets.every((d) => mealTypes.every((mt) => done.has(`${d}:${mt}`)));
-    const wait = rateLimited ? cooldownMs : allDone ? doneSleepMs : activeMs;
-    console.log(`${new Date().toLocaleTimeString()} 本轮结束（侦察 ${probe.d} ${MEAL_NAME[probe.mt]}${released ? " → 已放餐，扫荡完毕" : " 未放"}），${wait >= 60000 ? Math.round(wait / 60000) + " 分钟" : wait / 1000 + " 秒"}后再见`);
+    const wait = rateLimited ? cooldownMs : allDone ? doneSleepMs : watchGapMs;
+    console.log(`${new Date().toLocaleTimeString()} 本轮（守望 ${probe.d} ${MEAL_NAME[probe.mt]}${released ? " → 放餐！扫荡完毕" : " 未放"}），${wait >= 60000 ? Math.round(wait / 60000) + " 分钟" : wait / 1000 + " 秒"}后再见`);
     await sleep(wait);
   }
 }
