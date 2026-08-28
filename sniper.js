@@ -42,7 +42,9 @@ function nextWeekWorkdays() {
 let lastReqAt = 0;
 
 async function api(method, url, params, body) {
-  const gap = cfg.requestGapMs ?? 4000;
+  // 实测：GET 接口 50ms 间隔可行（0ms 连发触发限流，冷却约13分钟）；POST 下单不设限
+  // 取 500ms 留足余量：扫荡全流程 25 发约 12 秒完成
+  const gap = cfg.requestGapMs ?? 500;
   const wait = lastReqAt + gap - Date.now();
   if (wait > 0) await sleep(wait);
   lastReqAt = Date.now();
@@ -167,7 +169,7 @@ async function cmdWatch() {
   // 活跃窗口制：周一~周四完全静默长眠；周五 activeStartHour 起每分钟一轮
   // 周五之后（周末）窗口保持开启，用于「取消后自动补抢」；全部完成后每轮零请求
   const activeHour = cfg.activeStartHour ?? 13;
-  const activeMs = cfg.pollIntervalMs || 60000;
+  const activeMs = cfg.pollIntervalMs || 10000; // 实测单点侦察可承受更高频，10 秒一轮
   const useWindow = !(cfg.dates && cfg.dates.length); // 显式指定 dates 时不限窗口，便于测试
   const inWindow = (now = new Date()) => {
     const day = now.getDay(); // 0=周日 5=周五 6=周六

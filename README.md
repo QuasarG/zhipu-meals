@@ -195,16 +195,22 @@ CONFIG_DIR=/opt/zhipu-meals/alice node sniper.js check 20260818
 | `addressDetail` | string | 配送吧台名称，与 ID 对应 |
 | `dryRun` | boolean | `true` 只探测不下单（调试），实战设 `false` |
 | `activeStartHour` | number | 活跃窗口起点：周五几点开始抢，默认 13 |
-| `pollIntervalMs` | number | 侦察轮询间隔毫秒，默认 60000（1 分钟 1 发） |
-| `requestGapMs` | number | 全局请求步进：任意两请求最小间隔毫秒，默认 4000 |
+| `pollIntervalMs` | number | 侦察轮询间隔毫秒，默认 10000（10 秒，实测可承受更高频） |
+| `requestGapMs` | number | 全局请求步进：任意两请求最小间隔毫秒，默认 500（实测 GET 50ms 可行、0ms 触发限流，取 500 留余量） |
 | `scarceThreshold` | number | 稀缺阈值：余量低于此值（默认 100，即两位数）触发极速抢购 |
-| `rateLimitCooldownMin` | number | 被限流后静默退避分钟数，默认 10 |
+| `rateLimitCooldownMin` | number | 被限流后静默退避分钟数，默认 15（实测冷却约 13 分钟，勿重试续期） |
 | `doneSleepMin` | number | 本周全部完成后复查间隔分钟数，默认 30，到期检查是否跨周 |
 
 ## 活跃窗口 + 侦察/扫荡策略
 
 菜单在**每周五下午**发布，其余时间守望毫无意义。脚本按周历安排作息，
-并用两阶段节奏避免触发服务端频控（实测约 25 发/25 分钟即触发）：
+并用两阶段节奏避免触发服务端频控。**频控阈值经实测标定**（详见下表）：
+
+| 实测项 | 结论 |
+|---|---|
+| 菜单 GET 间隔 | 50ms 稳定可行；0ms 连发触发限流 |
+| 下单 POST | 0ms 连发 16 发均被接受（仅业务码拒绝重复下单），不限流 |
+| 限流冷却时长 | 约 13 分钟（期间反复重试会续期，务必静默等待） |
 
 - **周一 ~ 周四**：完全静默长眠，**零请求**，一觉睡到周五
 - **周五 `activeStartHour`（默认 13:00）**：准点醒来进入**侦察模式**——
