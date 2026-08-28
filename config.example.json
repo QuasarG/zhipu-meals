@@ -7,9 +7,9 @@
   "addressDetail": "",
   "dryRun": true,
   "activeStartHour": 13,
-  "pollIntervalMs": 60000,
-  "requestGapMs": 4000,
+  "pollIntervalMs": 10000,
+  "requestGapMs": 500,
   "scarceThreshold": 100,
-  "rateLimitCooldownMin": 10,
+  "rateLimitCooldownMin": 15,
   "doneSleepMin": 30
 }
