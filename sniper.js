@@ -38,7 +38,7 @@ function nextWeekWorkdays() {
   return out;
 }
 
-// 全局请求步进：可动态调整（守望期防限流；扫荡期降到 sweepGapMs）
+// 全局请求步进：动态调整（扫荡期 = 守望节奏 5s，杜绝突发）
 let lastReqAt = 0;
 let currentGapMs = null; // null = 用 cfg.requestGapMs
 
@@ -173,7 +173,6 @@ async function cmdWatch() {
   // 三段变速（实测令牌桶容量≈24-30、回血≈0.25-0.5发/秒；并发齐发不受限）：
   //   守望 5s/发（0.2发/秒 < 回血速率，永不触发）；发现放餐后 0.5s/发连拉 10 餐即停
   const watchGapMs = cfg.watchGapMs || 5000;
-  const sweepGapMs = cfg.sweepGapMs || 500;
   const inWindow = (now = new Date()) => {
     const day = now.getDay(); // 0=周日 5=周五 6=周六
     if (day === 5) return now.getHours() >= activeHour;
@@ -187,31 +186,12 @@ async function cmdWatch() {
     return t - now;
   };
   console.log(`守望 ${mealTypes.map((m) => MEAL_NAME[m]).join("+")} | 目标: ${cfg.dates && cfg.dates.length ? cfg.dates.join(", ") : "动态下周一~周五"}`);
-  console.log(`节奏: ${useWindow ? `周五 ${activeHour}:00 起守望 ${watchGapMs / 1000}s/发不停歇，放餐后 ${sweepGapMs}ms/发连拉菜单，齐发并发下单；周一~周四静默` : "指定 dates，不限窗口"}`);
+  console.log(`节奏: ${useWindow ? `周五 ${activeHour}:00 起守望 ${watchGapMs / 1000}s/发不停歇，放餐后 5s/发续扫+稀缺即时下单+并发齐发；周一~周四静默` : "指定 dates，不限窗口"}`);
   console.log(`策略: ${cfg.keywords && cfg.keywords.length ? "关键词[" + cfg.keywords.join(",") + "] + " : ""}份数最少优先 | 地址: ${cfg.addressDetail}(id=${cfg.addressId})`);
   if (cfg.dryRun) console.log("!! dryRun 模式：只探测不真实下单");
   const done = new Set(); // key: `${date}:${mealType}`
   let cursor = 0; // 守望轮转游标
 
-  // 并发下单（POST 实测不限流）：同批订单 Promise.all 齐发
-  async function fireOrders(batch) {
-    const results = await Promise.all(batch.map(async ({ d, mt, pkg }) => {
-      try {
-        const r = await createOrder({
-          mealType: mt,
-          orderDate: d,
-          packageName: pkg.packageName,
-          sequenceChar: pkg.sequenceChar,
-          addressId: cfg.addressId,
-          addressDetail: cfg.addressDetail,
-        });
-        return { d, mt, pkg, r };
-      } catch (e) {
-        return { d, mt, pkg, r: { code: -1, msg: e.message } };
-      }
-    }));
-    return results;
-  }
 
   while (true) {
     // 非活跃窗口：整轮跳过，零请求，一觉睡到周五 activeStartHour
@@ -246,6 +226,7 @@ async function cmdWatch() {
     }
 
     const probe = pending[cursor++ % pending.length];
+    let probeMenu = null;
     try {
       const menu = await getMenu(probe.mt, probe.d);
       if (isRateLimited(menu)) {
@@ -253,6 +234,7 @@ async function cmdWatch() {
         rateLimited = true;
       } else if (menu.code === 200 && Array.isArray(menu.data) && menu.data.length) {
         released = true;
+        probeMenu = menu.data;
       } else if (menu.code !== 200) {
         console.log(`[${probe.d} ${MEAL_NAME[probe.mt]}] 接口: ${menu.code} ${menu.msg || ""}`);
       }
@@ -260,21 +242,82 @@ async function cmdWatch() {
       console.error(`[${probe.d}] 守望异常:`, e.message);
     }
 
-    // 扫荡：探测到放餐，0.5s/发连拉全部菜单（共约10发短脉冲），拉完立即并发下单
+    // 扫荡：探测到放餐。节奏与守望一致（5s/发，杜绝突发——菜单接口节流器
+    // 约 5s/发，500ms 连发会在第 5-6 发被拍死且每次违规刷新惩罚期）
+    // 关键优化：侦察响应本身就带一份完整菜单 → 立即用它下单（~0.5 秒锁定首个目标）
     if (released && !rateLimited) {
       const t0 = Date.now();
-      currentGapMs = sweepGapMs; // 扫荡期提速
-      const dead = new Set();
-      const plan = []; // {d, mt, menus}
+      currentGapMs = watchGapMs; // 扫荡节奏 = 守望节奏，全速突发已被证明必死
+      const dead = new Set(); // 下单失败的 "日期|套餐名"，重选时排除
+      const batch = []; // 非稀缺目标，最后并发齐发
 
+      // 立即下单：用侦察带回的菜单，POST 不限流、不受步进约束，~0.5 秒锁定
+      async function orderNow(d, mt, menuData, viaPost) {
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const pkg = pickPackage(menuData, cfg.keywords, dead, d);
+          if (!pkg) {
+            console.log(`[${d} ${MEAL_NAME[mt]}] 无匹配项/全售罄`);
+            done.add(`${d}:${mt}`);
+            return;
+          }
+          console.log(`[${d} ${MEAL_NAME[mt]}] 命中 ${pkgDesc(pkg)} → 下单`);
+          if (cfg.dryRun) {
+            console.log(`[${d} ${MEAL_NAME[mt]}] dryRun: 模拟下单成功`);
+            done.add(`${d}:${mt}`);
+            return;
+          }
+          try {
+            const r = await createOrder({
+              mealType: mt,
+              orderDate: d,
+              packageName: pkg.packageName,
+              sequenceChar: pkg.sequenceChar,
+              addressId: cfg.addressId,
+              addressDetail: cfg.addressDetail,
+            });
+            if (r.code === 200) {
+              console.log(`[${d} ${MEAL_NAME[mt]}] ✓下单成功 orderId=${r.data?.orderId}`);
+              done.add(`${d}:${mt}`);
+              return;
+            }
+            if (isRateLimited(r)) {
+              console.log(`[${d} ${MEAL_NAME[mt]}] 被限流: ${r.msg}`);
+              rateLimited = true;
+              return;
+            }
+            if (/已存在订单|已点/.test(r.msg || "")) {
+              console.log(`[${d} ${MEAL_NAME[mt]}] 已有订单（手动点的），标记完成`);
+              done.add(`${d}:${mt}`);
+              return;
+            }
+            console.log(`[${d} ${MEAL_NAME[mt]}] 失败(${r.code}): ${r.msg} → 换候选`);
+            dead.add(`${d}|${pkg.packageName}`); // 重试循环会自动选下一个候选
+          } catch (e) {
+            console.error(`[${d} ${MEAL_NAME[mt]}] 下单异常:`, e.message);
+            return;
+          }
+        }
+        // 两次都失败：若所有候选都死光才标记完成，否则留给下一轮
+        if (!pickPackage(menuData, cfg.keywords, dead, d)) done.add(`${d}:${mt}`);
+      }
+
+      // 1) 侦察目标立即出手（侦察响应自带菜单，零额外请求）
+      if (!done.has(`${probe.d}:${probe.mt}`) && probeMenu) {
+        await orderNow(probe.d, probe.mt, probeMenu);
+      }
+
+      // 2) 逐日期拉剩余菜单（5s/发），稀缺款当场下单，普通款攒着并发齐发
+      const plan = [];
       for (const d of targets) {
+        if (rateLimited) break;
         const menus = {};
         for (const mt of mealTypes) {
           if (done.has(`${d}:${mt}`)) continue;
+          if (d === probe.d && mt === probe.mt) { menus[mt] = probeMenu; continue; }
           try {
             const menu = await getMenu(mt, d);
             if (isRateLimited(menu)) {
-              console.log(`[${d}] 拉菜单被限流: ${menu.msg}`);
+              console.log(`[${d}] 拉菜单被限流: ${menu.msg} → 退避（下轮 5s 节奏续扫）`);
               rateLimited = true;
               break;
             }
@@ -284,56 +327,33 @@ async function cmdWatch() {
           }
         }
         if (rateLimited) break;
-        for (const mt of Object.keys(menus)) plan.push({ d, mt, menus: menus[mt] });
+        for (const mt of Object.keys(menus)) {
+          if (done.has(`${d}:${mt}`)) continue;
+          const pkg = pickPackage(menus[mt], cfg.keywords, dead, d);
+          if (!pkg) {
+            done.add(`${d}:${mt}`);
+            continue;
+          }
+          if ((pkg.stockRemaining ?? Infinity) < (cfg.scarceThreshold ?? 100)) {
+            await orderNow(d, mt, menus[mt]); // 稀缺款当场出手
+          } else {
+            plan.push({ d, mt, menus: menus[mt] });
+          }
+        }
       }
 
+      // 3) 剩余普通款：并发齐发（POST 不限流）；失败换候选再来一批
       if (!rateLimited && plan.length) {
-        // 逐天查订单防重复（GET，带步进）
-        const orderCache = {};
-        const batch = [];
-        for (const { d, mt, menus } of plan) {
-          let o = orderCache[d];
-          if (!o) {
-            try {
-              o = await getMyOrder(d);
-            } catch (e) {
-              console.error(`[${d}] 订单查询异常:`, e.message);
-              continue;
-            }
-            if (isRateLimited(o)) { rateLimited = true; break; }
-            orderCache[d] = o;
-          }
-          const slot = o?.code === 200 && o.data ? o.data[MEAL_KEY[mt]] : null;
-          if (Array.isArray(slot) && slot.length && ![0, 3].includes(slot[0].orderStatus)) {
-            console.log(`[${d} ${MEAL_NAME[mt]}] 已有订单（${(slot[0].packageName || "").split("\n")[0]}），跳过`);
-            done.add(`${d}:${mt}`);
-            continue;
-          }
-          const pkg = pickPackage(menus, cfg.keywords, dead, d);
-          if (!pkg) {
-            console.log(`[${d} ${MEAL_NAME[mt]}] 无匹配项/全售罄`);
-            done.add(`${d}:${mt}`);
-            continue;
-          }
-          batch.push({ d, mt, pkg });
-        }
-
-        // 并发齐发下单（POST 实测不限流）；失败目标进死名单，换候选再打一批（最多两轮）
         for (let round = 0; round < 2 && !rateLimited; round++) {
-          if (!batch.length) break;
-          if (round > 0) {
-            // 重选候选：排除死名单后重新挑
-            batch.length = 0;
-            for (const { d, mt, menus } of plan) {
-              if (done.has(`${d}:${mt}`)) continue;
-              const pkg = pickPackage(menus, cfg.keywords, dead, d);
-              if (pkg) batch.push({ d, mt, pkg });
-              else { done.add(`${d}:${mt}`); }
-            }
-            if (!batch.length) break;
-            console.log(`--- 第二轮：换候选重试 ${batch.length} 个目标 ---`);
+          const batch = [];
+          for (const { d, mt, menus } of plan) {
+            if (done.has(`${d}:${mt}`)) continue;
+            const pkg = pickPackage(menus, cfg.keywords, dead, d);
+            if (pkg) batch.push({ d, mt, pkg });
+            else done.add(`${d}:${mt}`);
           }
-          batch.sort((a, b) => (a.pkg.stockRemaining ?? Infinity) - (b.pkg.stockRemaining ?? Infinity));
+          if (!batch.length) break;
+          if (round > 0) console.log(`--- 第二轮：换候选重试 ${batch.length} 个目标 ---`);
           if (cfg.dryRun) {
             for (const { d, mt, pkg } of batch) {
               console.log(`[${d} ${MEAL_NAME[mt]}] dryRun 命中 ${pkgDesc(pkg)}`);
@@ -341,7 +361,21 @@ async function cmdWatch() {
             }
             break;
           }
-          const results = await fireOrders(batch);
+          const results = await Promise.all(batch.map(async ({ d, mt, pkg }) => {
+            try {
+              const r = await createOrder({
+                mealType: mt,
+                orderDate: d,
+                packageName: pkg.packageName,
+                sequenceChar: pkg.sequenceChar,
+                addressId: cfg.addressId,
+                addressDetail: cfg.addressDetail,
+              });
+              return { d, mt, pkg, r };
+            } catch (e) {
+              return { d, mt, pkg, r: { code: -1, msg: e.message } };
+            }
+          }));
           for (const { d, mt, pkg, r } of results) {
             if (r.code === 200) {
               console.log(`[${d} ${MEAL_NAME[mt]}] ✓下单成功 ${pkgDesc(pkg)} orderId=${r.data?.orderId}`);
@@ -354,6 +388,7 @@ async function cmdWatch() {
               dead.add(`${d}|${pkg.packageName}`);
             }
           }
+          if (rateLimited || round === 1) break;
           if (!plan.some(({ d, mt }) => !done.has(`${d}:${mt}`))) break;
         }
       }
