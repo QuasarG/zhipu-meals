@@ -2,3 +2,9 @@
 config.json
 node_modules/
 *.log
+
+# 运行时状态（已完成的订单记录），不入库
+state.json
+
+# Mimosa 扫描器私有状态目录
+.mimosa/
